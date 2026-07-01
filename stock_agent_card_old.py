@@ -6,13 +6,6 @@ from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
 from duckduckgo_search import DDGS
 from dotenv import load_dotenv
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-    RetryError,
-)
 
 # --- HUGGING FACE IMPORTS ---
 from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
@@ -27,47 +20,17 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- RETRY HELPER: track attempt counts so the UI can show live retry progress ---
-def _log_retry_attempt(retry_state, label):
-    """Called by tenacity before each sleep between retries. Surfaces progress in Streamlit."""
-    attempt = retry_state.attempt_number
-    wait_time = retry_state.next_action.sleep if retry_state.next_action else 0
-    exc = retry_state.outcome.exception() if retry_state.outcome else None
-    msg = f"⚠️ {label} failed on attempt {attempt} ({exc}). Retrying in {wait_time:.1f}s..."
-    # st.status/st.write only work when a status container is active in this run;
-    # guard with try/except so retries never crash on a UI issue.
-    try:
-        st.toast(msg)
-    except Exception:
-        pass
-    print(msg)
-
-
 # 1. DATA EXTRACTION TOOL: Financials & Technicals via yfinance
-@retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=1, min=2, max=15),
-    retry=retry_if_exception_type(Exception),
-    before_sleep=lambda rs: _log_retry_attempt(rs, "yfinance data fetch"),
-    reraise=False,
-)
-def _fetch_stock_data_raw(ticker_symbol):
-    """Network call wrapped in retry. Raises on empty/invalid data so tenacity retries it."""
-    ticker = yf.Ticker(ticker_symbol)
-    info = ticker.info
-
-    # Historical data for Technical Analysis (6 months)
-    hist = ticker.history(period="6mo")
-    if hist.empty:
-        raise ValueError(f"Empty price history returned for {ticker_symbol}")
-
-    return ticker, info, hist
-
-
 def fetch_stock_data(ticker_symbol):
     try:
-        ticker, info, hist = _fetch_stock_data_raw(ticker_symbol)
-
+        ticker = yf.Ticker(ticker_symbol)
+        info = ticker.info
+        
+        # Historical data for Technical Analysis (6 months)
+        hist = ticker.history(period="6mo")
+        if hist.empty:
+            return None
+        
         # Calculate Technicals using 'ta' library
         close_prices = hist['Close']
         rsi = RSIIndicator(close=close_prices, window=14).rsi().iloc[-1]
@@ -101,37 +64,21 @@ def fetch_stock_data(ticker_symbol):
             "avg_volume": info.get("averageVolume", "N/A")
         }
         return data_pack
-    except RetryError as e:
-        st.error(f"Error gathering yfinance data after multiple retries: {e.last_attempt.exception()}")
-        return None
     except Exception as e:
         st.error(f"Error gathering yfinance data: {e}")
         return None
 
 # 2. DATA EXTRACTION TOOL: Real-time News via DuckDuckGo
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(Exception),
-    before_sleep=lambda rs: _log_retry_attempt(rs, "DuckDuckGo news search"),
-    reraise=False,
-)
-def _fetch_ddgs_results(query, max_results=5):
-    with DDGS() as ddgs:
-        return [r for r in ddgs.text(query, max_results=max_results)]
-
-
 def fetch_realtime_news(ticker_symbol):
     try:
-        query = f"{ticker_symbol} stock news earnings sentiment"
-        results = _fetch_ddgs_results(query, max_results=5)
-
+        with DDGS() as ddgs:
+            query = f"{ticker_symbol} stock news earnings sentiment"
+            results = [r for r in ddgs.text(query, max_results=5)]
+        
         news_text = ""
         for i, res in enumerate(results, 1):
             news_text += f"[{i}] {res['title']}\nSnippet: {res['body']}\n\n"
         return news_text if news_text else "No recent news found."
-    except RetryError as e:
-        return f"Could not fetch live news after multiple retries: {e.last_attempt.exception()}"
     except Exception as e:
         return f"Could not fetch live news due to: {e}"
 
@@ -277,51 +224,31 @@ Perform your analysis framework internally. Cross-reference {ticker} against its
         ])
 
         chain = prompt_template | llm
-
-        @retry(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=2, min=3, max=25),
-            retry=retry_if_exception_type(Exception),
-            before_sleep=lambda rs: _log_retry_attempt(rs, "LLM request"),
-            reraise=False,
-        )
-        def _invoke_llm(payload):
-            return chain.invoke(payload)
-
-        try:
-            response = _invoke_llm({
-                "ticker": ticker.upper(),
-                "current_price": stock_data["current_price"],
-                "business_summary": stock_data["business_summary"],
-                "revenue_growth": stock_data["revenue_growth"],
-                "earnings_growth": stock_data["earnings_growth"],
-                "profit_margins": stock_data["profit_margins"],
-                "debt_to_equity": stock_data["debt_to_equity"],
-                "free_cashflow": stock_data["free_cashflow"],
-                "pe_ratio": stock_data["pe_ratio"],
-                "peg_ratio": stock_data["peg_ratio"],
-                "ev_ebitda": stock_data["ev_ebitda"],
-                "pb_ratio": stock_data["pb_ratio"],
-                "roe": stock_data["roe"],
-                "institutional_ownership": stock_data["institutional_ownership"],
-                "rsi_14": stock_data["rsi_14"],
-                "macd": stock_data["macd"],
-                "macd_signal": stock_data["macd_signal"],
-                "sma_50": stock_data["sma_50"],
-                "sma_200": stock_data["sma_200"],
-                "recent_volume": stock_data["recent_volume"],
-                "avg_volume": stock_data["avg_volume"],
-                "news_context": news_data
-            })
-        except RetryError as e:
-            status.update(label="LLM Request Failed After Retries", state="error")
-            st.error(f"The model failed to respond after multiple attempts: {e.last_attempt.exception()}")
-            return
-        except Exception as e:
-            status.update(label="LLM Request Failed", state="error")
-            st.error(f"The model failed to respond: {e}")
-            return
-
+        response = chain.invoke({
+            "ticker": ticker.upper(),
+            "current_price": stock_data["current_price"],
+            "business_summary": stock_data["business_summary"],
+            "revenue_growth": stock_data["revenue_growth"],
+            "earnings_growth": stock_data["earnings_growth"],
+            "profit_margins": stock_data["profit_margins"],
+            "debt_to_equity": stock_data["debt_to_equity"],
+            "free_cashflow": stock_data["free_cashflow"],
+            "pe_ratio": stock_data["pe_ratio"],
+            "peg_ratio": stock_data["peg_ratio"],
+            "ev_ebitda": stock_data["ev_ebitda"],
+            "pb_ratio": stock_data["pb_ratio"],
+            "roe": stock_data["roe"],
+            "institutional_ownership": stock_data["institutional_ownership"],
+            "rsi_14": stock_data["rsi_14"],
+            "macd": stock_data["macd"],
+            "macd_signal": stock_data["macd_signal"],
+            "sma_50": stock_data["sma_50"],
+            "sma_200": stock_data["sma_200"],
+            "recent_volume": stock_data["recent_volume"],
+            "avg_volume": stock_data["avg_volume"],
+            "news_context": news_data
+        })
+        
         status.update(label="Research Report Dispatched!", state="complete")
 
     # --- PARSING TEXT RESPONSE INTO GRID COLUMNS ---
