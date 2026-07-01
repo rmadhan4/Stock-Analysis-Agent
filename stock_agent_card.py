@@ -135,6 +135,55 @@ def fetch_realtime_news(ticker_symbol):
     except Exception as e:
         return f"Could not fetch live news due to: {e}"
 
+
+# 2b. PEER IDENTIFICATION + REAL DATA FETCH
+# The LLM is only trusted to name a plausible peer ticker (stable, low-stakes knowledge).
+# All actual numbers for that peer (price, fundamentals, technicals) come from yfinance,
+# the same pipeline used for the primary ticker, so both are equally fresh.
+def identify_peer_ticker(primary_ticker, business_summary, llm):
+    """Ask the LLM for ONE peer ticker symbol only — no prices, no analysis."""
+    peer_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You identify publicly-traded peer/competitor companies. "
+         "Respond with ONLY the peer's stock ticker symbol in the exact format used by Yahoo Finance "
+         "(e.g. 'MSFT', 'RELIANCE.NS', 'TCS.NS'). No extra text, no explanation, no punctuation."),
+        ("user",
+         "Primary company ticker: {ticker}\n"
+         "Business summary: {summary}\n\n"
+         "Name ONE direct, actively-traded, same-sector competitor. "
+         "Respond with just its ticker symbol.")
+    ])
+    chain = peer_prompt | llm
+    try:
+        result = chain.invoke({
+            "ticker": primary_ticker,
+            "summary": (business_summary or "")[:500]  # keep it short/cheap
+        })
+        candidate = result.content.strip().split()[0]
+        # Strip stray punctuation/backticks the model might add
+        candidate = candidate.strip("`'\".,")
+        return candidate
+    except Exception:
+        return None
+
+
+def fetch_peer_data(primary_ticker, business_summary, llm, max_candidates=3):
+    """
+    Try to resolve a peer ticker and pull REAL, current data for it via fetch_stock_data.
+    Returns (peer_ticker, peer_data_dict) or (None, None) if no valid peer could be resolved.
+    """
+    tried = set()
+    for _ in range(max_candidates):
+        candidate = identify_peer_ticker(primary_ticker, business_summary, llm)
+        if not candidate or candidate.upper() == primary_ticker.upper() or candidate in tried:
+            continue
+        tried.add(candidate)
+
+        peer_data = fetch_stock_data(candidate)
+        if peer_data:
+            return candidate, peer_data
+    return None, None
+
 # 3. AGENT EXECUTION AND RENDERING ENGINE
 def run_stock_analysis_agent(ticker):
     # Fallback to check API token presence inside Streamlit process
@@ -154,7 +203,7 @@ def run_stock_analysis_agent(ticker):
         status.write(f"🌐 Fetching live market sentiment and news for {ticker.upper()}...")
         news_data = fetch_realtime_news(ticker)
 
-        status.write(f"🤖 Interfacing with Qwen-72B LLM Core...")
+        status.write("🔧 Connecting to Qwen-72B LLM Core...")
         llm_endpoint = HuggingFaceEndpoint(
             repo_id="Qwen/Qwen2.5-72B-Instruct", 
             task="text-generation",
@@ -163,94 +212,49 @@ def run_stock_analysis_agent(ticker):
         )
         llm = ChatHuggingFace(llm=llm_endpoint)
 
+        status.write("🔍 Identifying sector peer and pulling its live market data...")
+        peer_ticker, peer_data = fetch_peer_data(ticker.upper(), stock_data["business_summary"], llm)
+        if peer_data:
+            status.write(f"✅ Peer resolved: {peer_ticker} (current price: {peer_data['current_price']})")
+            peer_context = f"""
+Peer Ticker: {peer_ticker}
+Peer Current Price: {peer_data['current_price']}
+Peer Revenue Growth: {peer_data['revenue_growth']} | Peer Earnings Growth: {peer_data['earnings_growth']} | Peer Profit Margins: {peer_data['profit_margins']}
+Peer Valuation -> P/E: {peer_data['pe_ratio']} | PEG: {peer_data['peg_ratio']} | EV/EBITDA: {peer_data['ev_ebitda']} | P/B: {peer_data['pb_ratio']}
+Peer ROE: {peer_data['roe']} | Peer Debt/Equity: {peer_data['debt_to_equity']}
+Peer Technicals -> RSI(14): {peer_data['rsi_14']} | MACD: {peer_data['macd']} | MACD Signal: {peer_data['macd_signal']}
+Peer Moving Averages -> 50 SMA: {peer_data['sma_50']} | 200 SMA: {peer_data['sma_200']}
+"""
+        else:
+            status.write("⚠️ Could not resolve a verifiable peer with live data. Peer comparison will be skipped.")
+            peer_context = "No verifiable peer data could be retrieved. Do not fabricate a peer comparison — state that peer data was unavailable."
+
+        status.write(f"🤖 Running full analysis with Qwen-72B LLM Core...")
+
         # Altered system role to guarantee cleanly tokenized markdown string splits
-#         system_role = """
-# You are an institutional-grade Stock Analysis and Trade Recommendation Assistant. 
-# Your objective is to generate a comprehensive asset research dossier. 
-# You must divide your final response into EXACTLY 3 sections using these precise token markers:
-# "PART_1: Fundamental & Business Strategy"
-# "PART_2: Technicals & Sentiment Analysis"
-# "PART_3: Risks & Complete Trade Setup"
 
-# Core Rules within the layout:
-# 1. Challenge your own recommendation with at least three risks or bearish factors in Part 3.
-# 2. In Part 3, include the full Trade Setup breakdown: Current Price, Best Entry Price, Stop Loss, Target 1, Target 2, Risk/Reward Ratio, Confidence Score, and Final Recommendation.
-# 3. Conclude each section with a short paragraph titled "Historical Cycle Precedent:" before moving to the next section token.
-# """
-        # system_role = """
-        # You are an institutional-grade Stock Analysis and Trade Recommendation Assistant. 
-        # Your objective is to generate a comprehensive asset research dossier. 
-        # You must divide your final response into EXACTLY 3 sections using these precise token markers:
-        # "PART_1: Fundamental & Business Strategy"
-        # "PART_2: Technicals & Sentiment Analysis"
-        # "PART_3: Risks, Competitor Peer Comparison & Trade Setup"
-
-        # Core Rules within the layout:
-        # 1. Challenge your own recommendation with at least three risks or bearish factors in Part 3.
-        # 2. In Part 3, you MUST cross-examine the requested stock against its industry/sector peers. Suggest at least ONE alternative stock/share from the same sector that has better valuation metrics, stronger growth, or safer entry technicals than the requested stock. 
-        # 3. Provide a clear "Alternative Buy Suggestion" section in Part 3 detailing why that alternative share is a better buy right now, along with an actionable trade setup.
-        # 4. Conclude each section with a short paragraph titled "Historical Cycle Precedent:" before moving to the next section token.
-        # """
         system_role = """
-        You are an institutional-grade Stock Analysis and Trade Recommendation Assistant. 
-        Your objective is to generate a comprehensive asset research dossier. 
-        You must divide your final response into EXACTLY 3 sections using these precise token markers:
-        "PART_1: Fundamental & Business Strategy"
-        "PART_2: Technicals & Sentiment Analysis"
-        "PART_3: Risks & Complete Trade Setup"
+You are an institutional-grade Stock Analysis and Trade Recommendation Assistant. 
+Your objective is to generate a comprehensive asset research dossier divided into EXACTLY 3 sections using these precise token markers:
+"PART_1: Fundamental & Business Strategy"
+"PART_2: Technicals & Sentiment Analysis"
+"PART_3: Risks & Complete Trade Setup"
 
-        Core Rules within the layout:
-        1. Challenge your own recommendation with at least three risks or bearish factors in Part 3.
-        2. In Part 3, evaluate the searched stock against its primary industry peers. You MUST suggest at least ONE better alternative stock/share from the same sector with superior fundamentals or technical setups.
-        3. Conclude Part 3 with a distinct markdown block titled "### 🏛️ FINAL INVESTMENT VERDICT". In this block, you must make a definitive choice: State explicitly WHICH specific stock to buy (the searched stock OR the alternative). 
-        4. The Final Verdict must include:
-        - **Winner**: [Exact Ticker to Buy]
-        - **Core Thesis**: [1-2 sentences explaining why it beats the other]
-        - **Optimal Buy Price**: [Specific entry price or range]
-        - **Target Price**: [Specific target price]
-        - **Estimated Horizon**: [X Days - provide a specific number or range of days to achieve the target]
-        5. Conclude each section with a short paragraph titled "Historical Cycle Precedent:" before moving to the next section token.
-        """
-#         user_prompt = """
-# Analyze the following raw data collected for Ticker: {ticker}
+Core Rules for Peer Comparison and Fallbacks in Part 3:
+1. IF VALID PEER DATA IS AVAILABLE: Conduct a rigorous side-by-side comparison. State clearly which asset offers the superior risk-adjusted opportunity based on valuation, technicals, and growth.
+2. IF PEER DATA IS UNAVAILABLE OR CONTAINING ERRORS: Explicitly state under your peer analysis heading: "TECHNICAL ISSUE: Unable to retrieve live competitor metrics from the data extraction pipeline." Do not invent or hallucinate metrics.
+3. HANDLING DATA INSUFFICIENCY: If crucial primary or macro data is missing, state clearly: "INSUFFICIENT DATA AVAILABLE — Unable to issue a definitive recommendation to avoid a blind call." 
+4. THE STANDALONE BUY PATHWAY: If peer data is missing due to a technical issue, but the searched stock's data is fully complete AND displays strong core fundamentals, solid technical trends (e.g., healthy moving average alignment), and a favorable macroeconomic backdrop (e.g., industry tailwinds, supportive interest rate cycle), you must issue a strong and definitive BUY verdict for the searched stock.
 
-# --- RAW FUNDAMENTAL & TECHNICAL DATA ---
-# Current Price: {current_price}
-# Business Summary: {business_summary}
-# Revenue Growth: {revenue_growth} | Earnings Growth: {earnings_growth} | Profit Margins: {profit_margins}
-# Debt to Equity: {debt_to_equity} | Free Cash Flow: {free_cashflow}
-# Valuation Metrics -> P/E: {pe_ratio} | PEG: {peg_ratio} | EV/EBITDA: {ev_ebitda} | P/B: {pb_ratio}
-# Return on Equity (ROE): {roe} | Institutional Ownership: {institutional_ownership}
+Conclude Part 3 with a markdown block titled "### 🏛️ FINAL INVESTMENT VERDICT" structured exactly like this:
+- **Verdict**: [BUY <TICKER> / WAIT / INSUFFICIENT DATA]
+- **Core Thesis**: [1-2 sentences explaining the decision based on fundamental, technical, macro economic indicators, or data availability]
+- **BUY**: Optimal Buy Price: [Price], Target Price: [Price], Estimated Horizon: [X Days]
+- **WAIT/INSUFFICIENT DATA**: Watch-List Trigger / Next Steps: [Specific condition or missing element to re-evaluate], Re-Evaluate In: [X Days]
 
-# Technicals -> RSI(14): {rsi_14} | MACD: {macd} | MACD Signal: {macd_signal}
-# Moving Averages -> 50 SMA: {sma_50} | 200 SMA: {sma_200}
-# Volume -> Latest Session Volume: {recent_volume} | Avg Volume: {avg_volume}
+Conclude each section with a short paragraph titled "Historical Cycle Precedent:" before moving to the next section token.
+"""
 
-# --- REAL-TIME NEWS & WEB RESEARCH ---
-# {news_context}
-
-# Perform your analysis framework internally and produce your structured text output.
-# """
-        # user_prompt = """
-        # Analyze the following raw data collected for Ticker: {ticker}
-
-        # --- RAW FUNDAMENTAL & TECHNICAL DATA ---
-        # Current Price: {current_price}
-        # Business Summary: {business_summary}
-        # Revenue Growth: {revenue_growth} | Earnings Growth: {earnings_growth} | Profit Margins: {profit_margins}
-        # Debt to Equity: {debt_to_equity} | Free Cash Flow: {free_cashflow}
-        # Valuation Metrics -> P/E: {pe_ratio} | PEG: {peg_ratio} | EV/EBITDA: {ev_ebitda} | P/B: {pb_ratio}
-        # Return on Equity (ROE): {roe} | Institutional Ownership: {institutional_ownership}
-
-        # Technicals -> RSI(14): {rsi_14} | MACD: {macd} | MACD Signal: {macd_signal}
-        # Moving Averages -> 50 SMA: {sma_50} | 200 SMA: {sma_200}
-        # Volume -> Latest Session Volume: {recent_volume} | Avg Volume: {avg_volume}
-
-        # --- REAL-TIME NEWS & WEB RESEARCH ---
-        # {news_context}
-
-        # Perform your analysis framework internally. In your assessment, identify the sector/industry of {ticker}. Compare it to its prominent market peers, explicitly identify any other stock in that sector that features superior fundamentals/technicals right now, and outline why it represents a better buying opportunity. Produce your structured text output according to your system rules.
-        # """
         user_prompt = """
 Analyze the following raw data collected for Ticker: {ticker}
 
@@ -269,7 +273,15 @@ Volume -> Latest Session Volume: {recent_volume} | Avg Volume: {avg_volume}
 --- REAL-TIME NEWS & WEB RESEARCH ---
 {news_context}
 
-Perform your analysis framework internally. Cross-reference {ticker} against its sector competitors using your internal knowledge base. Identify a superior peer alternative, compare them, and issue your definitive final verdict. Ensure your verdict clearly provides a exact buying price and an explicit target horizon specified in **number of days**. Produce your structured text output.
+--- LIVE PEER/COMPETITOR DATA ---
+{peer_context}
+
+Execution Framework Instructions:
+1. Examine the 'LIVE PEER/COMPETITOR DATA' section. If it indicates data is unavailable or contains fallback text, explicitly output that a technical issue prevented peer metric collection. 
+2. If peer data is present, evaluate both stocks and pick the absolute best candidate.
+3. If peer data is missing but the primary ticker has stellar metrics, high institutional ownership, positive macro momentum, and clean technicals, do not default to wait. Issue a clear BUY verdict for {ticker}.
+4. If essential indicators are listed as 'N/A' or missing entirely, do not issue a blind call. State that data is insufficient.
+5. If a BUY verdict is reached, ensure the optimal entry price, target price, and horizon in **number of days** are mathematically aligned with the provided market figures. Produce your structured text output.
 """
         prompt_template = ChatPromptTemplate.from_messages([
             ("system", system_role),
@@ -311,7 +323,8 @@ Perform your analysis framework internally. Cross-reference {ticker} against its
                 "sma_200": stock_data["sma_200"],
                 "recent_volume": stock_data["recent_volume"],
                 "avg_volume": stock_data["avg_volume"],
-                "news_context": news_data
+                "news_context": news_data,
+                "peer_context": peer_context
             })
         except RetryError as e:
             status.update(label="LLM Request Failed After Retries", state="error")
