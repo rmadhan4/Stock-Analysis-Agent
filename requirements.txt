@@ -65,4 +65,5 @@ websockets==15.0.1
 xxhash==3.8.0
 yfinance==1.5.1
 zstandard==0.25.0
-python-dotenv
+python-dotenv==1.0.0
+langchain-huggingface==0.1.0
