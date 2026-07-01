@@ -107,6 +107,7 @@ def run_stock_analysis_agent(ticker):
             task="text-generation",
             temperature=0.2,
             max_new_tokens=2500,
+            max_retries=3,
         )
         llm = ChatHuggingFace(llm=llm_endpoint)
 
