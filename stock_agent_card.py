@@ -111,20 +111,93 @@ def run_stock_analysis_agent(ticker):
         llm = ChatHuggingFace(llm=llm_endpoint)
 
         # Altered system role to guarantee cleanly tokenized markdown string splits
+#         system_role = """
+# You are an institutional-grade Stock Analysis and Trade Recommendation Assistant. 
+# Your objective is to generate a comprehensive asset research dossier. 
+# You must divide your final response into EXACTLY 3 sections using these precise token markers:
+# "PART_1: Fundamental & Business Strategy"
+# "PART_2: Technicals & Sentiment Analysis"
+# "PART_3: Risks & Complete Trade Setup"
+
+# Core Rules within the layout:
+# 1. Challenge your own recommendation with at least three risks or bearish factors in Part 3.
+# 2. In Part 3, include the full Trade Setup breakdown: Current Price, Best Entry Price, Stop Loss, Target 1, Target 2, Risk/Reward Ratio, Confidence Score, and Final Recommendation.
+# 3. Conclude each section with a short paragraph titled "Historical Cycle Precedent:" before moving to the next section token.
+# """
+        # system_role = """
+        # You are an institutional-grade Stock Analysis and Trade Recommendation Assistant. 
+        # Your objective is to generate a comprehensive asset research dossier. 
+        # You must divide your final response into EXACTLY 3 sections using these precise token markers:
+        # "PART_1: Fundamental & Business Strategy"
+        # "PART_2: Technicals & Sentiment Analysis"
+        # "PART_3: Risks, Competitor Peer Comparison & Trade Setup"
+
+        # Core Rules within the layout:
+        # 1. Challenge your own recommendation with at least three risks or bearish factors in Part 3.
+        # 2. In Part 3, you MUST cross-examine the requested stock against its industry/sector peers. Suggest at least ONE alternative stock/share from the same sector that has better valuation metrics, stronger growth, or safer entry technicals than the requested stock. 
+        # 3. Provide a clear "Alternative Buy Suggestion" section in Part 3 detailing why that alternative share is a better buy right now, along with an actionable trade setup.
+        # 4. Conclude each section with a short paragraph titled "Historical Cycle Precedent:" before moving to the next section token.
+        # """
         system_role = """
-You are an institutional-grade Stock Analysis and Trade Recommendation Assistant. 
-Your objective is to generate a comprehensive asset research dossier. 
-You must divide your final response into EXACTLY 3 sections using these precise token markers:
-"PART_1: Fundamental & Business Strategy"
-"PART_2: Technicals & Sentiment Analysis"
-"PART_3: Risks & Complete Trade Setup"
+        You are an institutional-grade Stock Analysis and Trade Recommendation Assistant. 
+        Your objective is to generate a comprehensive asset research dossier. 
+        You must divide your final response into EXACTLY 3 sections using these precise token markers:
+        "PART_1: Fundamental & Business Strategy"
+        "PART_2: Technicals & Sentiment Analysis"
+        "PART_3: Risks & Complete Trade Setup"
 
-Core Rules within the layout:
-1. Challenge your own recommendation with at least three risks or bearish factors in Part 3.
-2. In Part 3, include the full Trade Setup breakdown: Current Price, Best Entry Price, Stop Loss, Target 1, Target 2, Risk/Reward Ratio, Confidence Score, and Final Recommendation.
-3. Conclude each section with a short paragraph titled "Historical Cycle Precedent:" before moving to the next section token.
-"""
+        Core Rules within the layout:
+        1. Challenge your own recommendation with at least three risks or bearish factors in Part 3.
+        2. In Part 3, evaluate the searched stock against its primary industry peers. You MUST suggest at least ONE better alternative stock/share from the same sector with superior fundamentals or technical setups.
+        3. Conclude Part 3 with a distinct markdown block titled "### 🏛️ FINAL INVESTMENT VERDICT". In this block, you must make a definitive choice: State explicitly WHICH specific stock to buy (the searched stock OR the alternative). 
+        4. The Final Verdict must include:
+        - **Winner**: [Exact Ticker to Buy]
+        - **Core Thesis**: [1-2 sentences explaining why it beats the other]
+        - **Optimal Buy Price**: [Specific entry price or range]
+        - **Target Price**: [Specific target price]
+        - **Estimated Horizon**: [X Days - provide a specific number or range of days to achieve the target]
+        5. Conclude each section with a short paragraph titled "Historical Cycle Precedent:" before moving to the next section token.
+        """
+#         user_prompt = """
+# Analyze the following raw data collected for Ticker: {ticker}
 
+# --- RAW FUNDAMENTAL & TECHNICAL DATA ---
+# Current Price: {current_price}
+# Business Summary: {business_summary}
+# Revenue Growth: {revenue_growth} | Earnings Growth: {earnings_growth} | Profit Margins: {profit_margins}
+# Debt to Equity: {debt_to_equity} | Free Cash Flow: {free_cashflow}
+# Valuation Metrics -> P/E: {pe_ratio} | PEG: {peg_ratio} | EV/EBITDA: {ev_ebitda} | P/B: {pb_ratio}
+# Return on Equity (ROE): {roe} | Institutional Ownership: {institutional_ownership}
+
+# Technicals -> RSI(14): {rsi_14} | MACD: {macd} | MACD Signal: {macd_signal}
+# Moving Averages -> 50 SMA: {sma_50} | 200 SMA: {sma_200}
+# Volume -> Latest Session Volume: {recent_volume} | Avg Volume: {avg_volume}
+
+# --- REAL-TIME NEWS & WEB RESEARCH ---
+# {news_context}
+
+# Perform your analysis framework internally and produce your structured text output.
+# """
+        # user_prompt = """
+        # Analyze the following raw data collected for Ticker: {ticker}
+
+        # --- RAW FUNDAMENTAL & TECHNICAL DATA ---
+        # Current Price: {current_price}
+        # Business Summary: {business_summary}
+        # Revenue Growth: {revenue_growth} | Earnings Growth: {earnings_growth} | Profit Margins: {profit_margins}
+        # Debt to Equity: {debt_to_equity} | Free Cash Flow: {free_cashflow}
+        # Valuation Metrics -> P/E: {pe_ratio} | PEG: {peg_ratio} | EV/EBITDA: {ev_ebitda} | P/B: {pb_ratio}
+        # Return on Equity (ROE): {roe} | Institutional Ownership: {institutional_ownership}
+
+        # Technicals -> RSI(14): {rsi_14} | MACD: {macd} | MACD Signal: {macd_signal}
+        # Moving Averages -> 50 SMA: {sma_50} | 200 SMA: {sma_200}
+        # Volume -> Latest Session Volume: {recent_volume} | Avg Volume: {avg_volume}
+
+        # --- REAL-TIME NEWS & WEB RESEARCH ---
+        # {news_context}
+
+        # Perform your analysis framework internally. In your assessment, identify the sector/industry of {ticker}. Compare it to its prominent market peers, explicitly identify any other stock in that sector that features superior fundamentals/technicals right now, and outline why it represents a better buying opportunity. Produce your structured text output according to your system rules.
+        # """
         user_prompt = """
 Analyze the following raw data collected for Ticker: {ticker}
 
@@ -143,9 +216,8 @@ Volume -> Latest Session Volume: {recent_volume} | Avg Volume: {avg_volume}
 --- REAL-TIME NEWS & WEB RESEARCH ---
 {news_context}
 
-Perform your analysis framework internally and produce your structured text output.
+Perform your analysis framework internally. Cross-reference {ticker} against its sector competitors using your internal knowledge base. Identify a superior peer alternative, compare them, and issue your definitive final verdict. Ensure your verdict clearly provides a exact buying price and an explicit target horizon specified in **number of days**. Produce your structured text output.
 """
-
         prompt_template = ChatPromptTemplate.from_messages([
             ("system", system_role),
             ("user", user_prompt)
@@ -200,21 +272,35 @@ Perform your analysis framework internally and produce your structured text outp
     # Create Side-by-Side Card Interface (Matching Image 2 Layout)
     col1, col2, col3 = st.columns(3)
     
+    # with col1:
+    #     # Orange Accent Border Bar
+    #     st.markdown("<div style='border-top: 5px solid #d97706; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
+    #     st.markdown(part_1_raw)
+
+    # with col2:
+    #     # Teal/Green Accent Border Bar
+    #     st.markdown("<div style='border-top: 5px solid #059669; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
+    #     st.markdown(part_2_raw)
+
+    # with col3:
+    #     # Crimson Red Accent Border Bar
+    #     st.markdown("<div style='border-top: 5px solid #dc2626; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
+    #     st.markdown(part_3_raw)
+# Create Side-by-Side Card Interface
+    col1, col2, col3 = st.columns(3)
+    
     with col1:
-        # Orange Accent Border Bar
         st.markdown("<div style='border-top: 5px solid #d97706; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
         st.markdown(part_1_raw)
 
     with col2:
-        # Teal/Green Accent Border Bar
         st.markdown("<div style='border-top: 5px solid #059669; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
         st.markdown(part_2_raw)
 
     with col3:
-        # Crimson Red Accent Border Bar
-        st.markdown("<div style='border-top: 5px solid #dc2626; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
+        # Changed the accent color to blue/indigo to emphasize "Suggestions & Trade Setup"
+        st.markdown("<div style='border-top: 5px solid #4f46e5; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
         st.markdown(part_3_raw)
-
     st.write("---")
     st.caption(
         "This analysis is for educational and research purposes only and should not be considered financial advice. "
