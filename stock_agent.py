@@ -1,6 +1,7 @@
 import os
 import yfinance as yf
 import pandas as pd
+import streamlit as st
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
 from duckduckgo_search import DDGS
