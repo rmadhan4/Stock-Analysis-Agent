@@ -6,68 +6,33 @@ from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
 from duckduckgo_search import DDGS
 from dotenv import load_dotenv
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-    RetryError,
-)
 
-# --- HUGGING FACE IMPORTS ---
+# --- HUGGING FACE / LANGCHAIN IMPORTS ---
 from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 from langchain_core.prompts import ChatPromptTemplate
 
+# --- MODULE PROMPTS ---
+import prompts
+
 load_dotenv()
 
-# Set up Streamlit Page Configuration
 st.set_page_config(
     page_title="Institutional Equity Research AI",
     page_icon="🏛️",
     layout="wide"
 )
 
-# --- RETRY HELPER: track attempt counts so the UI can show live retry progress ---
-def _log_retry_attempt(retry_state, label):
-    """Called by tenacity before each sleep between retries. Surfaces progress in Streamlit."""
-    attempt = retry_state.attempt_number
-    wait_time = retry_state.next_action.sleep if retry_state.next_action else 0
-    exc = retry_state.outcome.exception() if retry_state.outcome else None
-    msg = f"⚠️ {label} failed on attempt {attempt} ({exc}). Retrying in {wait_time:.1f}s..."
-    # st.status/st.write only work when a status container is active in this run;
-    # guard with try/except so retries never crash on a UI issue.
-    try:
-        st.toast(msg)
-    except Exception:
-        pass
-    print(msg)
-
-
 # 1. DATA EXTRACTION TOOL: Financials & Technicals via yfinance
-@retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=1, min=2, max=15),
-    retry=retry_if_exception_type(Exception),
-    before_sleep=lambda rs: _log_retry_attempt(rs, "yfinance data fetch"),
-    reraise=False,
-)
-def _fetch_stock_data_raw(ticker_symbol):
-    """Network call wrapped in retry. Raises on empty/invalid data so tenacity retries it."""
-    ticker = yf.Ticker(ticker_symbol)
-    info = ticker.info
-
-    # Historical data for Technical Analysis (6 months)
-    hist = ticker.history(period="6mo")
-    if hist.empty:
-        raise ValueError(f"Empty price history returned for {ticker_symbol}")
-
-    return ticker, info, hist
-
-
 def fetch_stock_data(ticker_symbol):
     try:
-        ticker, info, hist = _fetch_stock_data_raw(ticker_symbol)
-
+        ticker = yf.Ticker(ticker_symbol)
+        info = ticker.info
+        
+        # Historical data for Technical Analysis (6 months)
+        hist = ticker.history(period="6mo")
+        if hist.empty:
+            return None
+        
         # Calculate Technicals using 'ta' library
         close_prices = hist['Close']
         rsi = RSIIndicator(close=close_prices, window=14).rsi().iloc[-1]
@@ -77,8 +42,9 @@ def fetch_stock_data(ticker_symbol):
         sma_50 = SMAIndicator(close=close_prices, window=50).sma_indicator().iloc[-1]
         sma_200 = SMAIndicator(close=close_prices, window=200).sma_indicator().iloc[-1]
         
-        # Package metrics safely
-        data_pack = {
+        return {
+            "ticker": ticker_symbol.upper(),
+            "name": info.get("shortName") or info.get("longName") or ticker_symbol.upper(),
             "current_price": info.get("currentPrice") or info.get("regularMarketPrice") or close_prices.iloc[-1],
             "business_summary": info.get("longBusinessSummary", "N/A"),
             "revenue_growth": info.get("revenueGrowth", "N/A"),
@@ -97,101 +63,55 @@ def fetch_stock_data(ticker_symbol):
             "macd_signal": round(macd_signal, 4) if not pd.isna(macd_signal) else "N/A",
             "sma_50": round(sma_50, 2) if not pd.isna(sma_50) else "N/A",
             "sma_200": round(sma_200, 2) if not pd.isna(sma_200) else "N/A",
-            "recent_volume": hist['Volume'].iloc[-1],
+            "recent_volume": hist['Volume'].iloc[-1] if 'Volume' in hist.columns else "N/A",
             "avg_volume": info.get("averageVolume", "N/A")
         }
-        return data_pack
-    except RetryError as e:
-        st.error(f"Error gathering yfinance data after multiple retries: {e.last_attempt.exception()}")
+    except Exception:
         return None
-    except Exception as e:
-        st.error(f"Error gathering yfinance data: {e}")
-        return None
-
-# 2. DATA EXTRACTION TOOL: Real-time News via DuckDuckGo
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(Exception),
-    before_sleep=lambda rs: _log_retry_attempt(rs, "DuckDuckGo news search"),
-    reraise=False,
-)
-def _fetch_ddgs_results(query, max_results=5):
-    with DDGS() as ddgs:
-        return [r for r in ddgs.text(query, max_results=max_results)]
-
 
 def fetch_realtime_news(ticker_symbol):
     try:
-        query = f"{ticker_symbol} stock news earnings sentiment"
-        results = _fetch_ddgs_results(query, max_results=5)
-
+        query = f"{ticker_symbol} stock news earnings sentiment alpha"
+        with DDGS() as ddgs:
+            results = [r for r in ddgs.text(query, max_results=5)]
         news_text = ""
         for i, res in enumerate(results, 1):
             news_text += f"[{i}] {res['title']}\nSnippet: {res['body']}\n\n"
         return news_text if news_text else "No recent news found."
-    except RetryError as e:
-        return f"Could not fetch live news after multiple retries: {e.last_attempt.exception()}"
     except Exception as e:
         return f"Could not fetch live news due to: {e}"
 
-
-# 2b. PEER IDENTIFICATION + REAL DATA FETCH
-# The LLM is only trusted to name a plausible peer ticker (stable, low-stakes knowledge).
-# All actual numbers for that peer (price, fundamentals, technicals) come from yfinance,
-# the same pipeline used for the primary ticker, so both are equally fresh.
-def identify_peer_ticker(primary_ticker, business_summary, llm):
-    """Ask the LLM for ONE peer ticker symbol only — no prices, no analysis."""
-    peer_prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "You identify publicly-traded peer/competitor companies. "
-         "Respond with ONLY the peer's stock ticker symbol in the exact format used by Yahoo Finance "
-         "(e.g. 'MSFT', 'RELIANCE.NS', 'TCS.NS'). No extra text, no explanation, no punctuation."),
-        ("user",
-         "Primary company ticker: {ticker}\n"
-         "Business summary: {summary}\n\n"
-         "Name ONE direct, actively-traded, same-sector competitor. "
-         "Respond with just its ticker symbol.")
+def get_expanded_sector_list(primary_ticker, business_summary, llm):
+    """Instructs the LLM to give both standard peers and 2 micro-cap/multi-bagger prospects, enforcing strict industry alignment."""
+    sector_prompt = ChatPromptTemplate.from_messages([
+        ("system", "You output valid Python lists containing strings. "
+                   "Identify 4 active, liquid peer tickers matching the EXACT industry/sector of the input asset. "
+                   "CRITICAL DATA HYGIENE RULES:\n"
+                   "1. Ensure 2 items are massive industry benchmarks, and 2 are emerging high-growth stocks or potential small-cap multi-baggers from the SAME sector.\n"
+                   "2. DO NOT mix industries (e.g., do not suggest biotech like SRNE for a software company like PLTR).\n"
+                   "3. DO NOT return bankrupt, delisted, or dead penny stocks trading under $1.\n"
+                   "Output ONLY the raw bracketed python list. Example format: ['TICKER1', 'TICKER2', 'TICKER3', 'TICKER4']. No filler text."),
+        ("user", f"Asset Ticker: {primary_ticker}\nSummary: {business_summary[:500]}")
     ])
-    chain = peer_prompt | llm
+    chain = sector_prompt | llm
+    
     try:
-        result = chain.invoke({
-            "ticker": primary_ticker,
-            "summary": (business_summary or "")[:500]  # keep it short/cheap
-        })
-        candidate = result.content.strip().split()[0]
-        # Strip stray punctuation/backticks the model might add
-        candidate = candidate.strip("`'\".,")
-        return candidate
+        response = chain.invoke({})
+        text = response.content.strip()
+        if "[" in text and "]" in text:
+            raw_list = text[text.find("["):text.find("]")+1]
+            import ast
+            return [t.strip().upper() for t in ast.literal_eval(raw_list) if t.strip().upper() != primary_ticker.upper()]
     except Exception:
-        return None
+        pass
+    return []
 
-
-def fetch_peer_data(primary_ticker, business_summary, llm, max_candidates=3):
-    """
-    Try to resolve a peer ticker and pull REAL, current data for it via fetch_stock_data.
-    Returns (peer_ticker, peer_data_dict) or (None, None) if no valid peer could be resolved.
-    """
-    tried = set()
-    for _ in range(max_candidates):
-        candidate = identify_peer_ticker(primary_ticker, business_summary, llm)
-        if not candidate or candidate.upper() == primary_ticker.upper() or candidate in tried:
-            continue
-        tried.add(candidate)
-
-        peer_data = fetch_stock_data(candidate)
-        if peer_data:
-            return candidate, peer_data
-    return None, None
-
-# 3. AGENT EXECUTION AND RENDERING ENGINE
 def run_stock_analysis_agent(ticker):
-    # Fallback to check API token presence inside Streamlit process
     if "HUGGINGFACEHUB_API_TOKEN" not in os.environ or not os.environ["HUGGINGFACEHUB_API_TOKEN"]:
         st.error("Missing API Credentials. Please enter your Hugging Face API Token in the sidebar.")
         return
 
-    with st.status("🧠 Executing Institutional Analysis Pipeline...", expanded=True) as status:
+    with st.status("🧠 Executing Dual-Alpha Discovery Pipeline...", expanded=True) as status:
         status.write(f"📊 Pulling quantitative indicators for {ticker.upper()}...")
         stock_data = fetch_stock_data(ticker)
         
@@ -200,108 +120,61 @@ def run_stock_analysis_agent(ticker):
             st.error("Unable to process stock metrics. Please verify the ticker symbol.")
             return
 
-        status.write(f"🌐 Fetching live market sentiment and news for {ticker.upper()}...")
+        status.write(f"🌐 Sourcing live news & structural catalyst tracking data...")
         news_data = fetch_realtime_news(ticker)
 
-        status.write("🔧 Connecting to Qwen-72B LLM Core...")
+        status.write("🔧 Instantiating Qwen-72B LLM Core Layer...")
         llm_endpoint = HuggingFaceEndpoint(
             repo_id="Qwen/Qwen2.5-72B-Instruct", 
             task="text-generation",
-            temperature=0.2,
+            temperature=0.1,
             max_new_tokens=2500,
         )
         llm = ChatHuggingFace(llm=llm_endpoint)
 
-        status.write("🔍 Identifying sector peer and pulling its live market data...")
-        peer_ticker, peer_data = fetch_peer_data(ticker.upper(), stock_data["business_summary"], llm)
-        if peer_data:
-            status.write(f"✅ Peer resolved: {peer_ticker} (current price: {peer_data['current_price']})")
-            peer_context = f"""
-Peer Ticker: {peer_ticker}
-Peer Current Price: {peer_data['current_price']}
-Peer Revenue Growth: {peer_data['revenue_growth']} | Peer Earnings Growth: {peer_data['earnings_growth']} | Peer Profit Margins: {peer_data['profit_margins']}
-Peer Valuation -> P/E: {peer_data['pe_ratio']} | PEG: {peer_data['peg_ratio']} | EV/EBITDA: {peer_data['ev_ebitda']} | P/B: {peer_data['pb_ratio']}
-Peer ROE: {peer_data['roe']} | Peer Debt/Equity: {peer_data['debt_to_equity']}
-Peer Technicals -> RSI(14): {peer_data['rsi_14']} | MACD: {peer_data['macd']} | MACD Signal: {peer_data['macd_signal']}
-Peer Moving Averages -> 50 SMA: {peer_data['sma_50']} | 200 SMA: {peer_data['sma_200']}
-"""
-        else:
-            status.write("⚠️ Could not resolve a verifiable peer with live data. Peer comparison will be skipped.")
-            peer_context = "No verifiable peer data could be retrieved. Do not fabricate a peer comparison — state that peer data was unavailable."
+        status.write("🗂️ Generating expanded sector competitor array (Blue Chips + High Growth)...")
+        competitor_tickers = get_expanded_sector_list(ticker.upper(), stock_data["business_summary"], llm)
+        
+        status.write("📊 Compiling live peer data matrices...")
+        peer_data_map = {}
+        matrix_context = ""
+        for t in competitor_tickers:
+            p_data = fetch_stock_data(t)
+            if p_data:
+                peer_data_map[t.upper()] = p_data
+                matrix_context += f"Candidate Ticker: {p_data['ticker']} | Company Name: {p_data['name']} | Price: {p_data['current_price']} | Rev Growth: {p_data['revenue_growth']}\n"
 
-        status.write(f"🤖 Running full analysis with Qwen-72B LLM Core...")
-
-        # Altered system role to guarantee cleanly tokenized markdown string splits
-
-        system_role = """
-You are an institutional-grade Stock Analysis and Trade Recommendation Assistant. 
-Your objective is to generate a comprehensive asset research dossier divided into EXACTLY 3 sections using these precise token markers:
-"PART_1: Fundamental & Business Strategy"
-"PART_2: Technicals & Sentiment Analysis"
-"PART_3: Risks & Complete Trade Setup"
-
-Core Rules for Peer Comparison and Fallbacks in Part 3:
-1. IF VALID PEER DATA IS AVAILABLE: Conduct a rigorous side-by-side comparison. State clearly which asset offers the superior risk-adjusted opportunity based on valuation, technicals, and growth.
-2. IF PEER DATA IS UNAVAILABLE OR CONTAINING ERRORS: Explicitly state under your peer analysis heading: "TECHNICAL ISSUE: Unable to retrieve live competitor metrics from the data extraction pipeline." Do not invent or hallucinate metrics.
-3. HANDLING DATA INSUFFICIENCY: If crucial primary or macro data is missing, state clearly: "INSUFFICIENT DATA AVAILABLE — Unable to issue a definitive recommendation to avoid a blind call." 
-4. THE STANDALONE BUY PATHWAY: If peer data is missing due to a technical issue, but the searched stock's data is fully complete AND displays strong core fundamentals, solid technical trends (e.g., healthy moving average alignment), and a favorable macroeconomic backdrop (e.g., industry tailwinds, supportive interest rate cycle), you must issue a strong and definitive BUY verdict for the searched stock.
-
-Conclude Part 3 with a markdown block titled "### 🏛️ FINAL INVESTMENT VERDICT" structured exactly like this:
-- **Verdict**: [BUY <TICKER> / WAIT / INSUFFICIENT DATA]
-- **Core Thesis**: [1-2 sentences explaining the decision based on fundamental, technical, macro economic indicators, or data availability]
-- **BUY**: Optimal Buy Price: [Price], Target Price: [Price], Estimated Horizon: [X Days]
-- **WAIT/INSUFFICIENT DATA**: Watch-List Trigger / Next Steps: [Specific condition or missing element to re-evaluate], Re-Evaluate In: [X Days]
-
-Conclude each section with a short paragraph titled "Historical Cycle Precedent:" before moving to the next section token.
-"""
-
-        user_prompt = """
-Analyze the following raw data collected for Ticker: {ticker}
-
---- RAW FUNDAMENTAL & TECHNICAL DATA ---
-Current Price: {current_price}
-Business Summary: {business_summary}
-Revenue Growth: {revenue_growth} | Earnings Growth: {earnings_growth} | Profit Margins: {profit_margins}
-Debt to Equity: {debt_to_equity} | Free Cash Flow: {free_cashflow}
-Valuation Metrics -> P/E: {pe_ratio} | PEG: {peg_ratio} | EV/EBITDA: {ev_ebitda} | P/B: {pb_ratio}
-Return on Equity (ROE): {roe} | Institutional Ownership: {institutional_ownership}
-
-Technicals -> RSI(14): {rsi_14} | MACD: {macd} | MACD Signal: {macd_signal}
-Moving Averages -> 50 SMA: {sma_50} | 200 SMA: {sma_200}
-Volume -> Latest Session Volume: {recent_volume} | Avg Volume: {avg_volume}
-
---- REAL-TIME NEWS & WEB RESEARCH ---
-{news_context}
-
---- LIVE PEER/COMPETITOR DATA ---
-{peer_context}
-
-Execution Framework Instructions:
-1. Examine the 'LIVE PEER/COMPETITOR DATA' section. If it indicates data is unavailable or contains fallback text, explicitly output that a technical issue prevented peer metric collection. 
-2. If peer data is present, evaluate both stocks and pick the absolute best candidate.
-3. If peer data is missing but the primary ticker has stellar metrics, high institutional ownership, positive macro momentum, and clean technicals, do not default to wait. Issue a clear BUY verdict for {ticker}.
-4. If essential indicators are listed as 'N/A' or missing entirely, do not issue a blind call. State that data is insufficient.
-5. If a BUY verdict is reached, ensure the optimal entry price, target price, and horizon in **number of days** are mathematically aligned with the provided market figures. Produce your structured text output.
-"""
-        prompt_template = ChatPromptTemplate.from_messages([
-            ("system", system_role),
-            ("user", user_prompt)
+        status.write("🎯 Isolating the high-growth multi-bagger addition programmatically...")
+        select_prompt = ChatPromptTemplate.from_messages([
+            ("system", prompts.SECTOR_RANKING_SYSTEM),
+            ("user", prompts.SECTOR_RANKING_USER)
         ])
+        selector_chain = select_prompt | llm
+        
+        try:
+            selection_res = selector_chain.invoke({"sector_matrix_context": matrix_context})
+            selected_mb_ticker = selection_res.content.strip().split()[0].strip("`'\".,").upper()
+            if selected_mb_ticker not in peer_data_map:
+                selected_mb_ticker = list(peer_data_map.keys())[0]
+            mb_data = peer_data_map[selected_mb_ticker]
+        except Exception:
+            selected_mb_ticker = "N/A"
+            mb_data = {"ticker": "N/A", "current_price": "N/A", "revenue_growth": "N/A", "pe_ratio": "N/A", "rsi_14": "N/A"}
+        # Programmatic Filter: Map remaining assets exclusively into Stable Peers to avoid multi-bagger tunnel vision
+        stable_peers_context = ""
+        for t, data in peer_data_map.items():
+            if t != selected_mb_ticker:
+                stable_peers_context += f"- Ticker: {data['ticker']} | Price: {data['current_price']} | P/E: {data['pe_ratio']} | Rev Growth: {data['revenue_growth']} | Margin: {data['profit_margins']}\n"
 
+        status.write(f"🤖 Synthesizing complete balanced institutional research dossier...")
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("system", prompts.SYSTEM_ROLE),
+            ("user", prompts.USER_PROMPT)
+        ])
         chain = prompt_template | llm
 
-        @retry(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=2, min=3, max=25),
-            retry=retry_if_exception_type(Exception),
-            before_sleep=lambda rs: _log_retry_attempt(rs, "LLM request"),
-            reraise=False,
-        )
-        def _invoke_llm(payload):
-            return chain.invoke(payload)
-
         try:
-            response = _invoke_llm({
+            response = chain.invoke({
                 "ticker": ticker.upper(),
                 "current_price": stock_data["current_price"],
                 "business_summary": stock_data["business_summary"],
@@ -323,92 +196,61 @@ Execution Framework Instructions:
                 "sma_200": stock_data["sma_200"],
                 "recent_volume": stock_data["recent_volume"],
                 "avg_volume": stock_data["avg_volume"],
-                "news_context": news_data,
-                "peer_context": peer_context
+                
+                # Verified allocations split explicitly to match prompts.py parameters
+                "stable_peers_context": stable_peers_context if stable_peers_context else "No distinct stable peer data recorded.",
+                "mb_ticker": mb_data["ticker"],
+                "mb_price": mb_data["current_price"],
+                "mb_revenue_growth": mb_data["revenue_growth"],
+                "mb_pe": mb_data["pe_ratio"],
+                
+                "news_context": news_data
             })
-        except RetryError as e:
-            status.update(label="LLM Request Failed After Retries", state="error")
-            st.error(f"The model failed to respond after multiple attempts: {e.last_attempt.exception()}")
-            return
+            status.update(label="Dual Alpha Report Dispatched!", state="complete")
         except Exception as e:
-            status.update(label="LLM Request Failed", state="error")
-            st.error(f"The model failed to respond: {e}")
+            status.update(label="Pipeline Processing Failure", state="error")
+            st.error(f"Error during execution: {e}")
             return
 
-        status.update(label="Research Report Dispatched!", state="complete")
-
-    # --- PARSING TEXT RESPONSE INTO GRID COLUMNS ---
     raw_content = response.content
-    
-    # Safely divide the raw LLM markdown payload into individual variables
     try:
         part_1_raw = raw_content.split("PART_2:")[0].replace("PART_1:", "").strip()
         part_2_raw = raw_content.split("PART_2:")[1].split("PART_3:")[0].strip()
         part_3_raw = raw_content.split("PART_3:")[1].strip()
     except IndexError:
-        # Fallback handling structure in case of token variations
-        part_1_raw = "### 1. Fundamentals Analysis\n" + raw_content[:len(raw_content)//3]
-        part_2_raw = "### 2. Technical Dynamics\n" + raw_content[len(raw_content)//3: 2*len(raw_content)//3]
-        part_3_raw = "### 3. Risk & Final Trade Framework\n" + raw_content[2*len(raw_content)//3:]
+        part_1_raw = "### 1. Core Fundamental Architecture\n" + raw_content[:len(raw_content)//3]
+        part_2_raw = "### 2. Sector Volatility & Technical Setup\n" + raw_content[len(raw_content)//3: 2*len(raw_content)//3]
+        part_3_raw = "### 3. Comparative Allocations & Alpha Recommendations\n" + raw_content[2*len(raw_content)//3:]
 
-    # Display clean wide banner
-    st.markdown(f"## 🏛️ Equity Valuation Dossier: {ticker.upper()}")
+    st.markdown(f"## 🏛️ Comprehensive Sector Core & Multi-Bagger Report: {ticker.upper()}")
     st.write("---")
 
-    # Create Side-by-Side Card Interface (Matching Image 2 Layout)
     col1, col2, col3 = st.columns(3)
-    
-    # with col1:
-    #     # Orange Accent Border Bar
-    #     st.markdown("<div style='border-top: 5px solid #d97706; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
-    #     st.markdown(part_1_raw)
-
-    # with col2:
-    #     # Teal/Green Accent Border Bar
-    #     st.markdown("<div style='border-top: 5px solid #059669; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
-    #     st.markdown(part_2_raw)
-
-    # with col3:
-    #     # Crimson Red Accent Border Bar
-    #     st.markdown("<div style='border-top: 5px solid #dc2626; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
-    #     st.markdown(part_3_raw)
-# Create Side-by-Side Card Interface
-    col1, col2, col3 = st.columns(3)
-    
     with col1:
         st.markdown("<div style='border-top: 5px solid #d97706; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
         st.markdown(part_1_raw)
-
     with col2:
         st.markdown("<div style='border-top: 5px solid #059669; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
         st.markdown(part_2_raw)
-
     with col3:
-        # Changed the accent color to blue/indigo to emphasize "Suggestions & Trade Setup"
         st.markdown("<div style='border-top: 5px solid #4f46e5; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
         st.markdown(part_3_raw)
+        
     st.write("---")
-    st.caption(
-        "This analysis is for educational and research purposes only and should not be considered financial advice. "
-        "Markets involve risk, and all investment decisions should be independently verified."
-    )
+    st.caption("Educational research data framework. All equity positions introduce varying investment risks.")
 
-# --- STREAMLIT CONTROL FRONTEND ---
 def main():
     st.sidebar.title("🔐 Agent Controls")
-    
-    # Prompt user for their token via the web UI sidebar safely
     hf_api_token = st.sidebar.text_input("Hugging Face Hub API Token", type="password")
-    
-    ticker_input = st.sidebar.text_input("Enter Ticker Asset (e.g., RELIANCE.NS, TSLA, AAPL)", value="RELIANCE.NS")
-    trigger_analysis = st.sidebar.button("Run Research Agent", type="primary")
+    ticker_input = st.sidebar.text_input("Enter Ticker Asset (e.g., MSFT, TATAGOLD.NS, RELIANCE.NS)", value="MSFT")
+    trigger_analysis = st.sidebar.button("Run Portfolio Discovery", type="primary")
     
     if trigger_analysis:
         if hf_api_token:
             os.environ["HUGGINGFACEHUB_API_TOKEN"] = hf_api_token
             run_stock_analysis_agent(ticker_input.strip())
         else:
-            st.sidebar.error("Error: Please provide a valid Hugging Face Token.")
+            st.sidebar.error("Error: Please provide a valid token configuration.")
 
 if __name__ == "__main__":
     main()
